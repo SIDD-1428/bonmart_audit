@@ -3,6 +3,7 @@ import { Stack, useRouter, useSegments } from "expo-router";
 import React, { useEffect, useState } from "react";
 
 import InAppNotification from "@/components/InAppNotification";
+import NotificationPermissionManager from "@/components/NotificationPermissionManager";
 import { AuthProvider } from "@/context/AuthContext";
 import { NotificationProvider } from "@/context/NotificationContext";
 import auth from "@react-native-firebase/auth";
@@ -112,6 +113,7 @@ useEffect(() => {
     <NotificationProvider>
       <AuthProvider>
         <CartProvider>
+          <NotificationPermissionManager />
           <Stack
             screenOptions={{
               headerShown: false,
