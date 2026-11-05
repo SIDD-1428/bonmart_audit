@@ -22,6 +22,68 @@ import { Image } from "expo-image";
 import { useCart } from "../context/CartContext";
 import { db } from "../firebase/config";
 
+
+
+/**
+ * Wait until the backend has completed the stock transaction.
+ * The initial snapshot also handles the case where the function finished
+ * before this listener was attached.
+ */
+function waitForOrderProcessing(
+  orderRef: any,
+  timeoutMs = 45000
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let unsubscribe: (() => void) | undefined;
+    let settled = false;
+
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      unsubscribe?.();
+      if (error) reject(error);
+      else resolve();
+    };
+
+    const timeout = setTimeout(() => {
+      const error: any = new Error(
+        "Your order was submitted but is still being verified. Please check My Orders before trying again."
+      );
+      error.code = "ORDER_PROCESSING_TIMEOUT";
+      finish(error);
+    }, timeoutMs);
+
+    unsubscribe = orderRef.onSnapshot(
+      (snapshot: any) => {
+        if (!snapshot.exists) {
+          finish(new Error("The submitted order could not be found."));
+          return;
+        }
+
+        const order = snapshot.data();
+
+        if (order.status === "Rejected") {
+          finish(new Error(
+            order.rejectionReason || "The store could not process this order. Your cart has been kept."
+          ));
+          return;
+        }
+
+        if (order.status === "Cancelled") {
+          finish(new Error("This order was cancelled before checkout completed."));
+          return;
+        }
+
+        if (order.stockDeducted === true) {
+          finish();
+        }
+      },
+      (error: Error) => finish(error)
+    );
+  });
+}
+
 const Colors = {
   background: "#FFFFFF",
   card: "#FFFFFF",
@@ -41,6 +103,7 @@ const Colors = {
 export default function Checkout() {
   const { cart, clearCart, syncProductDetails } = useCart();
   const [placingOrder, setPlacingOrder] = useState(false);
+  const [pendingOrderId, setPendingOrderId] = useState<string | null>(null);
   const [addresses, setAddresses] = useState<any[]>([]);
   const [selectedAddress, setSelectedAddress] = useState<any>(null);
   const [showAddressSelector, setShowAddressSelector] = useState(false);
@@ -113,6 +176,14 @@ export default function Checkout() {
 
   const placeOrder = async () => {
     if (placingOrder) return;
+
+    if (pendingOrderId) {
+      Alert.alert(
+        "Order Already Submitted",
+        `Order ${pendingOrderId} is still awaiting verification. Please check My Orders before placing another order.`
+      );
+      return;
+    }
 
     if (cart.length === 0) {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -303,6 +374,24 @@ export default function Checkout() {
         },
         createdAt: firestore.FieldValue.serverTimestamp(),
       });
+
+      // Creating the order document does not mean stock has been reserved.
+      // Wait for the Cloud Function to confirm its transaction before clearing
+      // the cart or showing the order-confirmed screen.
+      try {
+        await waitForOrderProcessing(orderRef, 45000);
+      } catch (processingError: any) {
+        if (processingError?.code === "ORDER_PROCESSING_TIMEOUT") {
+          setPendingOrderId(orderRef.id);
+          setPlacingOrder(false);
+          Alert.alert(
+            "Order Submitted — Verification Pending",
+            `Your order ID is ${orderRef.id}. Stock verification is taking longer than expected. Your cart has been kept. Please check My Orders before trying again.`
+          );
+          return;
+        }
+        throw processingError;
+      }
 
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       setPlacingOrder(false);
@@ -951,9 +1040,9 @@ export default function Checkout() {
           <Text style={styles.bottomTotalValue}>₹{grandTotal}</Text>
         </View>
         <TouchableOpacity
-          style={[styles.placeOrderBtn, placingOrder && styles.placeOrderDisabled]}
+          style={[styles.placeOrderBtn, (placingOrder || !!pendingOrderId) && styles.placeOrderDisabled]}
           onPress={placeOrder}
-          disabled={placingOrder}
+          disabled={placingOrder || !!pendingOrderId}
           activeOpacity={0.8}
         >
           <LinearGradient
@@ -964,7 +1053,9 @@ export default function Checkout() {
               <ActivityIndicator size="small" color="#FFFFFF" />
             ) : (
               <>
-                <Text style={styles.placeOrderText}>Place Order</Text>
+                <Text style={styles.placeOrderText}>
+                  {pendingOrderId ? "Order Submitted" : "Place Order"}
+                </Text>
                 <Ionicons name="arrow-forward" size={18} color="#FFFFFF" />
               </>
             )}
