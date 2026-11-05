@@ -1,5 +1,6 @@
 import CategoryCard from "@/components/CategoryCard";
 import FloatingCart from "@/components/FloatingCart";
+import PromotionalBannerSlider from "@/components/PromotionalBannerSlider";
 import { calculateDistance } from "@/utils/calculateDistance";
 import { Ionicons } from "@expo/vector-icons";
 import auth from "@react-native-firebase/auth";
@@ -319,6 +320,7 @@ export default function CustomerHome() {
         },
       ]}
     >
+      <PromotionalBannerSlider />
       <View style={styles.categoryGrid}>
         {sections.map((section: any) => (
           <CategoryCard
