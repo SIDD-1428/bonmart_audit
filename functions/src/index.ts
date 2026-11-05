@@ -144,6 +144,22 @@ export const processNewOrder = onDocumentCreated(
           productSnaps.push(await transaction.get(productRef));
         }
 
+        const deliverySettingsSnap = await transaction.get(
+          db.collection("settings").doc("delivery")
+        );
+        const configuredThreshold = Number(
+          deliverySettingsSnap.data()?.freeDeliveryThreshold ?? 1000
+        );
+        if (
+          !Number.isFinite(configuredThreshold) ||
+          configuredThreshold < 500 ||
+          configuredThreshold > 5000
+        ) {
+          throw new OrderValidationError(
+            "DELIVERY_SETTINGS_INVALID: The store's free-delivery settings are invalid."
+          );
+        }
+
         let calculatedSubtotal = 0;
         const stockUpdates: Array<{
           ref: FirebaseFirestore.DocumentReference;
@@ -214,7 +230,7 @@ export const processNewOrder = onDocumentCreated(
         }
 
         calculatedSubtotal = money(calculatedSubtotal);
-        const expectedDeliveryCharge = calculatedSubtotal >= 999 ? 0 : 30;
+        const expectedDeliveryCharge = calculatedSubtotal >= configuredThreshold ? 0 : 30;
         const expectedDiscount = 0;
         const expectedGrandTotal = money(
           calculatedSubtotal + expectedDeliveryCharge - expectedDiscount
