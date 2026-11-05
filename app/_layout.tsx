@@ -151,10 +151,6 @@ useEffect(() => {
                 />
 
                 <Stack.Screen name="personal-info" />
-
-                <Stack.Screen
-                name="notification-permission"
-                />
               </>
             )}
           </Stack>
