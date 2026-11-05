@@ -8,6 +8,7 @@ import { AuthProvider } from "@/context/AuthContext";
 import { NotificationProvider } from "@/context/NotificationContext";
 import auth from "@react-native-firebase/auth";
 import { CartProvider } from "../context/CartContext";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 
 export default function RootLayout() {
   const router = useRouter();
@@ -110,7 +111,9 @@ useEffect(() => {
   }
 
   return (
-    <NotificationProvider>
+    <SafeAreaProvider>
+      <SafeAreaView style={{ flex: 1 }} edges={["bottom"]}>
+        <NotificationProvider>
       <AuthProvider>
         <CartProvider>
           <NotificationPermissionManager />
@@ -158,6 +161,8 @@ useEffect(() => {
           <InAppNotification />
         </CartProvider>
       </AuthProvider>
-    </NotificationProvider>
+        </NotificationProvider>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
