@@ -3,93 +3,139 @@ import { db } from "@/firebase/config";
 import auth from "@react-native-firebase/auth";
 import firestore from "@react-native-firebase/firestore";
 import messaging from "@react-native-firebase/messaging";
+import { PermissionsAndroid, Platform } from "react-native";
 
-export async function requestNotificationPermission() {
+export type NotificationPermissionResult = "granted" | "denied" | "blocked";
+
+const POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS";
+
+function isAuthorized(status: number) {
+  return (
+    status === messaging.AuthorizationStatus.AUTHORIZED ||
+    status === messaging.AuthorizationStatus.PROVISIONAL
+  );
+}
+
+export async function hasNotificationPermission(): Promise<boolean> {
   try {
-    const authStatus = await messaging().requestPermission();
-
-    const enabled =
-      authStatus === messaging.AuthorizationStatus.AUTHORIZED ||
-      authStatus === messaging.AuthorizationStatus.PROVISIONAL;
-
-    if (!enabled) {
-      console.log("Notification permission denied");
-      return false;
+    if (Platform.OS === "android" && Number(Platform.Version) >= 33) {
+      return await PermissionsAndroid.check(POST_NOTIFICATIONS);
     }
 
-    console.log("Notification permission granted");
-    return true;
+    const status = await messaging().hasPermission();
+    return isAuthorized(status);
   } catch (error) {
-    console.log("Notification permission error:", error);
+    console.log("Unable to check notification permission:", error);
     return false;
   }
 }
 
-export async function initializeNotifications() {
+export async function requestNotificationPermission(): Promise<NotificationPermissionResult> {
   try {
-    const authStatus = await messaging().hasPermission();
+    if (Platform.OS === "android" && Number(Platform.Version) >= 33) {
+      const result = await PermissionsAndroid.request(POST_NOTIFICATIONS, {
+        title: "Allow BonMart notifications",
+        message:
+          "BonMart uses notifications to keep you updated about order confirmation, packing and delivery.",
+        buttonPositive: "Allow",
+        buttonNegative: "Not now",
+      });
 
-    const enabled =
-      authStatus === messaging.AuthorizationStatus.AUTHORIZED ||
-      authStatus === messaging.AuthorizationStatus.PROVISIONAL;
-
-    if (!enabled) {
-      console.log("Notification permission not granted yet");
-      return;
+      if (result === PermissionsAndroid.RESULTS.GRANTED) return "granted";
+      if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) return "blocked";
+      return "denied";
     }
 
-    const token = await messaging().getToken();
+    const status = await messaging().requestPermission();
+    if (isAuthorized(status)) return "granted";
 
-    console.log("FCM Token:", token);
+    // iOS does not provide another system prompt after permission is denied.
+    if (Platform.OS === "ios" && status === messaging.AuthorizationStatus.DENIED) {
+      return "blocked";
+    }
 
-    const user = auth().currentUser;
+    return "denied";
+  } catch (error) {
+    console.log("Notification permission request failed:", error);
+    return "denied";
+  }
+}
 
-    if (!user) return;
+let initializedUid: string | null = null;
+let activeUnsubscribers: Array<() => void> = [];
 
-    await db.collection("users").doc(user.uid).update({
+function stopNotificationListeners() {
+  activeUnsubscribers.forEach((unsubscribe) => unsubscribe());
+  activeUnsubscribers = [];
+  initializedUid = null;
+}
+
+async function saveFcmToken(uid: string, token: string) {
+  await db.collection("users").doc(uid).set(
+    {
       fcmToken: token,
       notificationEnabled: true,
       tokenUpdatedAt: firestore.FieldValue.serverTimestamp(),
-    });
+    },
+    { merge: true }
+  );
+}
 
-    messaging().onTokenRefresh(async (newToken) => {
-      console.log("FCM Token Refreshed:", newToken);
+export async function initializeNotifications(): Promise<(() => void) | null> {
+  const user = auth().currentUser;
+  if (!user) return null;
 
-      const currentUser = auth().currentUser;
+  if (initializedUid === user.uid) {
+    return stopNotificationListeners;
+  }
 
-      if (!currentUser) return;
+  stopNotificationListeners();
+  initializedUid = user.uid;
 
-      await db.collection("users").doc(currentUser.uid).update({
-        fcmToken: newToken,
-        tokenUpdatedAt: firestore.FieldValue.serverTimestamp(),
-      });
-    });
+  try {
+    const token = await messaging().getToken();
+    await saveFcmToken(user.uid, token);
+    console.log("BonMart FCM token registered.");
 
-    messaging().onMessage(async (remoteMessage) => {
-      console.log("Foreground Notification:", remoteMessage);
+    activeUnsubscribers.push(
+      messaging().onTokenRefresh(async (newToken) => {
+        const currentUser = auth().currentUser;
+        if (!currentUser) return;
 
-      showNotification({
-        title: remoteMessage.notification?.title ?? "Notification",
-        body: remoteMessage.notification?.body ?? "",
-        orderId: String(remoteMessage.data?.orderId ?? ""),
-      });
-    });
+        try {
+          await saveFcmToken(currentUser.uid, newToken);
+          console.log("BonMart FCM token refreshed.");
+        } catch (error) {
+          console.log("Unable to save refreshed FCM token:", error);
+        }
+      })
+    );
 
-    messaging().onNotificationOpenedApp((remoteMessage) => {
-      console.log("Opened from notification:", remoteMessage);
-    });
+    activeUnsubscribers.push(
+      messaging().onMessage(async (remoteMessage) => {
+        showNotification({
+          title: remoteMessage.notification?.title ?? "BonMart update",
+          body: remoteMessage.notification?.body ?? "",
+          orderId: String(remoteMessage.data?.orderId ?? ""),
+        });
+      })
+    );
 
-    const initialNotification =
-      await messaging().getInitialNotification();
+    activeUnsubscribers.push(
+      messaging().onNotificationOpenedApp((remoteMessage) => {
+        console.log("Opened from notification:", remoteMessage);
+      })
+    );
 
+    const initialNotification = await messaging().getInitialNotification();
     if (initialNotification) {
-      console.log(
-        "Opened app from quit state:",
-        initialNotification
-      );
+      console.log("App opened from a notification:", initialNotification);
     }
 
+    return stopNotificationListeners;
   } catch (error) {
-    console.log("Notification Init Error:", error);
+    console.log("Notification initialization failed:", error);
+    stopNotificationListeners();
+    return null;
   }
 }
