@@ -108,6 +108,7 @@ export default function Checkout() {
   const [selectedAddress, setSelectedAddress] = useState<any>(null);
   const [showAddressSelector, setShowAddressSelector] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<"COD" | "QR">("COD");
+  const [freeDeliveryThreshold, setFreeDeliveryThreshold] = useState(1000);
   const [qrCodeUrl, setQrCodeUrl] = useState("");
   const [loadingQR, setLoadingQR] = useState(false);
 
@@ -116,7 +117,7 @@ export default function Checkout() {
     0
   );
 
-  const deliveryCharge = subtotal >= 999 ? 0 : 30;
+  const deliveryCharge = subtotal >= freeDeliveryThreshold ? 0 : 30;
   const discount = 0;
   const grandTotal = subtotal + deliveryCharge - discount;
 
@@ -124,6 +125,7 @@ export default function Checkout() {
     React.useCallback(() => {
       loadAddresses();
       loadPaymentQR();
+      loadDeliverySettings();
     }, [])
   );
 
@@ -151,6 +153,29 @@ export default function Checkout() {
     setLoadingQR(false);
   }
 };
+  const loadDeliverySettings = async () => {
+    try {
+      const snapshot = await db
+        .collection("settings")
+        .doc("delivery")
+        .get();
+
+      const configuredThreshold = Number(
+        snapshot.data()?.freeDeliveryThreshold ?? 1000
+      );
+
+      if (
+        Number.isFinite(configuredThreshold) &&
+        configuredThreshold >= 500 &&
+        configuredThreshold <= 5000
+      ) {
+        setFreeDeliveryThreshold(configuredThreshold);
+      }
+    } catch (error) {
+      console.log("Failed to load free-delivery settings:", error);
+    }
+  };
+
   const loadAddresses = async () => {
     try {
       const user = auth().currentUser;
@@ -237,6 +262,22 @@ export default function Checkout() {
       if (!delivery) {
         throw new Error("Delivery settings not configured");
       }
+
+      const currentFreeDeliveryThreshold = Number(
+        delivery.freeDeliveryThreshold ?? 1000
+      );
+      if (
+        !Number.isFinite(currentFreeDeliveryThreshold) ||
+        currentFreeDeliveryThreshold < 500 ||
+        currentFreeDeliveryThreshold > 5000
+      ) {
+        throw new Error("The store's free-delivery settings are invalid. Please contact the store.");
+      }
+
+      const orderDeliveryCharge =
+        subtotal >= currentFreeDeliveryThreshold ? 0 : 30;
+      const orderGrandTotal = subtotal + orderDeliveryCharge - discount;
+      setFreeDeliveryThreshold(currentFreeDeliveryThreshold);
 
       //radius validation
       const distance = calculateDistance(
@@ -350,9 +391,9 @@ export default function Checkout() {
         })),
         pricing: {
           subtotal,
-          deliveryCharge,
+          deliveryCharge: orderDeliveryCharge,
           discount,
-          grandTotal,
+          grandTotal: orderGrandTotal,
         },
         invoice: {
           number: `PS-INV-${Date.now()}`,
@@ -363,7 +404,7 @@ export default function Checkout() {
           method: paymentMethod === "COD" ? "Cash on Delivery" : "QR Payment",
           status: "Pending",
         },
-        total: grandTotal,
+        total: orderGrandTotal,
         status: "Pending",
         stockDeducted: false,
         stockRestored: false,
