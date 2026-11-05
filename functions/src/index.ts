@@ -9,305 +9,426 @@ admin.initializeApp();
 
 const db = admin.firestore();
 
+type OrderItem = {
+  productId: string;
+  quantity: number;
+  unitPrice: number;
+  name?: string;
+};
 
-//notifications
-async function sendNotificationToUser(
-  userId: string,
-  title: string,
-  body: string
-) {
-  const userSnap = await db.collection("users").doc(userId).get();
-
-  if (!userSnap.exists) return;
-
-  const token = userSnap.data()?.fcmToken;
-
-  if (!token) {
-    console.log("No FCM token for", userId);
-    return;
-  }
-
-  try{await getMessaging().send({
-    token,
-    notification: {
-      title,
-      body,
-    },
-    android: {
-      priority: "high",
-    },
-  });
-console.log("Notification sent");
-}catch (error: any) {
-  console.error("Notification Error:", error);
-
-  if (
-    error.code === "messaging/registration-token-not-registered" ||
-    error.code === "messaging/invalid-registration-token"
-  ) {
-    await db.collection("users").doc(userId).update({
-      fcmToken: admin.firestore.FieldValue.delete(),
-    });
+class OrderValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OrderValidationError";
   }
 }
 
-  
+function money(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+function aggregateItems(items: unknown): Map<string, { quantity: number; name: string }> {
+  if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
+    throw new OrderValidationError("INVALID_ORDER: The order must contain between 1 and 100 items.");
+  }
 
-export const restoreStockAfterCancellation = onDocumentUpdated(
-  
-  {
-    document: "orders/{orderId}",
-    region: "asia-south1",
-  },
-  async (event) => {
-    console.log("Function started");
-    const before = event.data?.before.data();
-    const after = event.data?.after.data();
+  const aggregated = new Map<string, { quantity: number; name: string }>();
 
-    if (!before || !after) return;
+  for (const rawItem of items) {
+    const item = rawItem as Partial<OrderItem>;
+    const productId = typeof item.productId === "string" ? item.productId.trim() : "";
+    const quantity = Number(item.quantity);
 
-    console.log("CANCEL TRIGGER");
-    console.log("Order:", event.params.orderId);
-    console.log("Before Status:", before.status);
-    console.log("After Status:", after.status);
-    console.log("Stock Deducted:", after.stockDeducted);
-    console.log("Stock Restored:", after.stockRestored);
+    if (!productId) {
+      throw new OrderValidationError("INVALID_PRODUCT: An order item has no valid product ID.");
+    }
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      throw new OrderValidationError(`INVALID_QUANTITY: ${item.name ?? productId}`);
+    }
 
-    if (
-      before.status === "Pending" &&
-      after.status === "Cancelled" &&
-      after.stockDeducted === true &&
-      after.stockRestored === false
-    ) {
-      try {
-        await db.runTransaction(async (transaction) => {
-        const orderRef = db.collection("orders").doc(event.params.orderId);
-
-        for (const item of after.items || []) {
-          transaction.update(
-            db.collection("products").doc(item.productId),
-            {
-              stock: admin.firestore.FieldValue.increment(item.quantity),
-            }
-          );
-        }
-
-        transaction.update(orderRef, {
-          stockRestored: true,
-          "payment.status": "Cancelled",
-        });
-      });
-      console.log(`stock restored for order ${event.params.orderId}`);
-      }
-       catch (err) {
-        console.error("Restore Stock Error:", err);
+    const existing = aggregated.get(productId);
+    if (existing) {
+      existing.quantity += quantity;
+      if (!Number.isSafeInteger(existing.quantity)) {
+        throw new OrderValidationError(`INVALID_QUANTITY: ${item.name ?? productId}`);
       }
     } else {
-      console.log("Conditions not satisfied. Skipping restore.");
+      aggregated.set(productId, {
+        quantity,
+        name: typeof item.name === "string" ? item.name : productId,
+      });
     }
   }
-);
 
+  return aggregated;
+}
+
+async function sendNotificationToUser(
+  userId: string | undefined,
+  title: string,
+  body: string
+): Promise<void> {
+  if (!userId) return;
+
+  try {
+    const userRef = db.collection("users").doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return;
+
+    const token = userSnap.data()?.fcmToken;
+    if (typeof token !== "string" || !token) return;
+
+    await getMessaging().send({
+      token,
+      notification: { title, body },
+      android: { priority: "high" },
+    });
+  } catch (error: any) {
+    console.error("Notification error:", error);
+
+    if (
+      error?.code === "messaging/registration-token-not-registered" ||
+      error?.code === "messaging/invalid-registration-token"
+    ) {
+      try {
+        await db.collection("users").doc(userId).update({
+          fcmToken: admin.firestore.FieldValue.delete(),
+        });
+      } catch (cleanupError) {
+        console.error("Unable to remove invalid FCM token:", cleanupError);
+      }
+    }
+    // FCM is best-effort; a notification failure must not fail order processing.
+  }
+}
+
+/**
+ * Validates a new customer order and deducts stock in one Firestore transaction.
+ * The transaction re-reads the latest order and product documents before writing.
+ */
 export const processNewOrder = onDocumentCreated(
   {
     document: "orders/{orderId}",
     region: "asia-south1",
+    retry: true,
   },
   async (event) => {
-    const order = event.data?.data();
-
-    if (!order) return;
-
-    if (order.stockDeducted) return;
+    const createdOrder = event.data?.data();
+    if (!createdOrder) return;
 
     const orderRef = db.collection("orders").doc(event.params.orderId);
 
     try {
       await db.runTransaction(async (transaction) => {
-        const updates: {
-          ref: FirebaseFirestore.DocumentReference;
-          newStock: number;
-        }[] = [];
+        const orderSnap = await transaction.get(orderRef);
+        if (!orderSnap.exists) return;
 
-        const latestOrderSnap = await transaction.get(orderRef);
+        const order = orderSnap.data();
+        if (!order) return;
 
-        if (!latestOrderSnap.exists) return;
+        // Duplicate events and orders already cancelled must not deduct stock.
+        if (order.stockDeducted === true || order.status !== "Pending") return;
 
-        const latestOrder = latestOrderSnap.data();
-
-        if (!latestOrder) return;
-
-        if (latestOrder.status === "Cancelled") {
-          console.log(
-            `Order ${event.params.orderId} already cancelled.`
-          );
-          return;
+        if (typeof order.userId !== "string" || !order.userId) {
+          throw new OrderValidationError("INVALID_ORDER: Missing customer ID.");
         }
 
-        if (!Array.isArray(latestOrder.items) || latestOrder.items.length === 0) {
-          throw new Error("EMPTY_ORDER: No products were submitted.");
+        const groupedItems = aggregateItems(order.items);
+        const productRefs = Array.from(groupedItems.keys()).map((id) =>
+          db.collection("products").doc(id)
+        );
+
+        // Read all product documents before issuing any transaction writes.
+        const productSnaps = [];
+        for (const productRef of productRefs) {
+          productSnaps.push(await transaction.get(productRef));
         }
 
         let calculatedSubtotal = 0;
+        const stockUpdates: Array<{
+          ref: FirebaseFirestore.DocumentReference;
+          newStock: number;
+        }> = [];
 
-        for (const item of latestOrder.items) {
-          const quantity = Number(item.quantity);
-          if (!Number.isInteger(quantity) || quantity <= 0) {
-            throw new Error(`INVALID_QUANTITY:${item.name ?? item.productId}`);
-          }
-
-          const productRef = db
-            .collection("products")
-            .doc(item.productId);
-
-          const productSnap = await transaction.get(productRef);
+        for (let i = 0; i < productRefs.length; i++) {
+          const productRef = productRefs[i];
+          const productSnap = productSnaps[i];
+          const productId = productRef.id;
+          const grouped = groupedItems.get(productId)!;
 
           if (!productSnap.exists) {
-            throw new Error(`${item.name} not found`);
+            throw new OrderValidationError(`PRODUCT_NOT_FOUND: ${grouped.name}`);
           }
 
           const product = productSnap.data();
-
           if (!product) {
-            throw new Error(`${item.name} not found`);
+            throw new OrderValidationError(`PRODUCT_NOT_FOUND: ${grouped.name}`);
           }
 
           const currentPrice = Number(product.price);
-          const submittedPrice = Number(item.unitPrice);
-          if (!Number.isFinite(currentPrice) || submittedPrice !== currentPrice) {
-            throw new Error(
-              `PRICE_CHANGED:${item.name ?? product.name ?? item.productId}:₹${currentPrice}`
-            );
-          }
-
           const currentStock = Number(product.stock ?? 0);
-          if (currentStock < quantity) {
-            throw new Error(`${item.name ?? product.name} is out of stock`);
+
+          if (!Number.isFinite(currentPrice) || currentPrice < 0) {
+            throw new OrderValidationError(`INVALID_PRODUCT_PRICE: ${grouped.name}`);
+          }
+          if (!Number.isSafeInteger(currentStock) || currentStock < 0) {
+            throw new OrderValidationError(`INVALID_PRODUCT_STOCK: ${grouped.name}`);
+          }
+          if (currentStock < grouped.quantity) {
+            throw new OrderValidationError(`OUT_OF_STOCK: ${grouped.name}`);
           }
           if (product.isAvailable === false || product.isActive === false) {
-            throw new Error(`${item.name ?? product.name} is currently unavailable`);
-          }
-          if (product.maxOrderQty != null && quantity > Number(product.maxOrderQty)) {
-            throw new Error(`ORDER_LIMIT:${item.name ?? product.name}: maximum ${product.maxOrderQty}`);
+            throw new OrderValidationError(`UNAVAILABLE: ${grouped.name}`);
           }
 
-          calculatedSubtotal += currentPrice * quantity;
-          updates.push({ ref: productRef, newStock: currentStock - quantity });
+          if (product.maxOrderQty != null) {
+            const maxOrderQty = Number(product.maxOrderQty);
+            if (
+              !Number.isSafeInteger(maxOrderQty) ||
+              maxOrderQty < 1 ||
+              grouped.quantity > maxOrderQty
+            ) {
+              throw new OrderValidationError(
+                `ORDER_LIMIT: ${grouped.name} (maximum ${product.maxOrderQty})`
+              );
+            }
+          }
+
+          // Validate each submitted line price against the current server price.
+          const matchingLines = (order.items as OrderItem[]).filter(
+            (item) => item.productId === productId
+          );
+          for (const line of matchingLines) {
+            if (money(Number(line.unitPrice)) !== money(currentPrice)) {
+              throw new OrderValidationError(
+                `PRICE_CHANGED: ${grouped.name}. Current price is ₹${money(currentPrice)}.`
+              );
+            }
+          }
+
+          calculatedSubtotal += currentPrice * grouped.quantity;
+          stockUpdates.push({
+            ref: productRef,
+            newStock: currentStock - grouped.quantity,
+          });
         }
 
+        calculatedSubtotal = money(calculatedSubtotal);
         const expectedDeliveryCharge = calculatedSubtotal >= 999 ? 0 : 30;
-        const expectedGrandTotal = calculatedSubtotal + expectedDeliveryCharge;
-        const submittedSubtotal = Number(latestOrder.pricing?.subtotal);
-        const submittedDeliveryCharge = Number(latestOrder.pricing?.deliveryCharge);
-        const submittedDiscount = Number(latestOrder.pricing?.discount ?? 0);
-        const submittedTotal = Number(latestOrder.pricing?.grandTotal);
-        const submittedOrderTotal = Number(latestOrder.total);
+        const expectedDiscount = 0;
+        const expectedGrandTotal = money(
+          calculatedSubtotal + expectedDeliveryCharge - expectedDiscount
+        );
+
+        const submittedSubtotal = Number(order.pricing?.subtotal);
+        const submittedDeliveryCharge = Number(order.pricing?.deliveryCharge);
+        const submittedDiscount = Number(order.pricing?.discount ?? 0);
+        const submittedGrandTotal = Number(order.pricing?.grandTotal);
+        const submittedOrderTotal = Number(order.total);
+
         if (
           !Number.isFinite(submittedSubtotal) ||
           !Number.isFinite(submittedDeliveryCharge) ||
           !Number.isFinite(submittedDiscount) ||
-          !Number.isFinite(submittedTotal) ||
+          !Number.isFinite(submittedGrandTotal) ||
           !Number.isFinite(submittedOrderTotal) ||
-          Math.abs(submittedSubtotal - calculatedSubtotal) > 0.01 ||
-          Math.abs(submittedDeliveryCharge - expectedDeliveryCharge) > 0.01 ||
-          Math.abs(submittedDiscount) > 0.01 ||
-          Math.abs(submittedTotal - expectedGrandTotal) > 0.01 ||
-          Math.abs(submittedOrderTotal - expectedGrandTotal) > 0.01
+          money(submittedSubtotal) !== calculatedSubtotal ||
+          money(submittedDeliveryCharge) !== expectedDeliveryCharge ||
+          money(submittedDiscount) !== expectedDiscount ||
+          money(submittedGrandTotal) !== expectedGrandTotal ||
+          money(submittedOrderTotal) !== expectedGrandTotal
         ) {
-          throw new Error("ORDER_TOTAL_MISMATCH: Please refresh your cart and try again.");
+          throw new OrderValidationError(
+            "ORDER_TOTAL_MISMATCH: Your cart total has changed. Please refresh your cart and try again."
+          );
         }
 
-        for (const update of updates) {
-          transaction.update(update.ref, {
-            stock: update.newStock,
-          });
+        for (const update of stockUpdates) {
+          transaction.update(update.ref, { stock: update.newStock });
         }
 
         transaction.update(orderRef, {
           stockDeducted: true,
-          processedAt:admin.firestore.FieldValue.serverTimestamp(),
+          processedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
       });
+    } catch (error: any) {
+      console.error(`Order processing failed (${event.params.orderId}):`, error);
 
-      console.log(`Processed order ${event.params.orderId}`);
-      await sendNotificationToUser(
-      order.userId,
-      "Order Placed",
-      "We've received your order and will start preparing it shortly."
-    );
+      if (error instanceof OrderValidationError) {
+        // Reject only if the order is still pending and stock has not been deducted.
+        await db.runTransaction(async (transaction) => {
+          const latestSnap = await transaction.get(orderRef);
+          if (!latestSnap.exists) return;
 
-    } catch (err: any) {
-      console.error(err);
+          const latest = latestSnap.data();
+          if (
+            !latest ||
+            latest.status !== "Pending" ||
+            latest.stockDeducted === true
+          ) {
+            return;
+          }
 
-      await orderRef.update({
-        status: "Rejected",
-        rejectionReason: err.message,
-        "payment.status": "Failed",
-      });
+          transaction.update(orderRef, {
+            status: "Rejected",
+            rejectionReason: error.message,
+            "payment.status": "Failed",
+            rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+        return;
+      }
+
+      // Retry unexpected/transient failures rather than rejecting a valid order.
+      throw error;
     }
   }
 );
 
+/**
+ * Restores stock once when an already-processed order transitions to Cancelled.
+ * This handles cancellations initiated by either a customer or an admin.
+ */
+export const restoreStockAfterCancellation = onDocumentUpdated(
+  {
+    document: "orders/{orderId}",
+    region: "asia-south1",
+    retry: true,
+  },
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (!before || !after) return;
+
+    if (before.status === "Cancelled" || after.status !== "Cancelled") return;
+
+    const orderRef = db.collection("orders").doc(event.params.orderId);
+
+    await db.runTransaction(async (transaction) => {
+      const latestOrderSnap = await transaction.get(orderRef);
+      if (!latestOrderSnap.exists) return;
+
+      const latestOrder = latestOrderSnap.data();
+      if (
+        !latestOrder ||
+        latestOrder.status !== "Cancelled" ||
+        latestOrder.stockDeducted !== true ||
+        latestOrder.stockRestored === true
+      ) {
+        return;
+      }
+
+      const groupedItems = aggregateItems(latestOrder.items);
+      const productRefs = Array.from(groupedItems.keys()).map((id) =>
+        db.collection("products").doc(id)
+      );
+
+      const productSnaps = [];
+      for (const productRef of productRefs) {
+        productSnaps.push(await transaction.get(productRef));
+      }
+
+      const stockUpdates: Array<{
+        ref: FirebaseFirestore.DocumentReference;
+        newStock: number;
+      }> = [];
+
+      for (let i = 0; i < productRefs.length; i++) {
+        const productRef = productRefs[i];
+        const productSnap = productSnaps[i];
+        const grouped = groupedItems.get(productRef.id)!;
+
+        if (!productSnap.exists) {
+          throw new Error(`Cannot restore stock: product ${productRef.id} does not exist.`);
+        }
+
+        const currentStock = Number(productSnap.data()?.stock ?? 0);
+        if (!Number.isSafeInteger(currentStock) || currentStock < 0) {
+          throw new Error(`Cannot restore stock: invalid stock for ${productRef.id}.`);
+        }
+
+        const restoredStock = currentStock + grouped.quantity;
+        if (!Number.isSafeInteger(restoredStock)) {
+          throw new Error(`Cannot restore stock: invalid restored quantity for ${productRef.id}.`);
+        }
+
+        stockUpdates.push({ ref: productRef, newStock: restoredStock });
+      }
+
+      for (const update of stockUpdates) {
+        transaction.update(update.ref, { stock: update.newStock });
+      }
+
+      transaction.update(orderRef, {
+        stockRestored: true,
+        "payment.status": "Cancelled",
+        stockRestoredAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+  }
+);
+
+/**
+ * Sends notifications after successful stock deduction and on later status
+ * changes. FCM notifications are best-effort and are not exactly-once.
+ */
 export const notifyCustomerOrderUpdates = onDocumentUpdated(
   {
     document: "orders/{orderId}",
     region: "asia-south1",
+    retry: true,
   },
   async (event) => {
-
     const before = event.data?.before.data();
     const after = event.data?.after.data();
-
     if (!before || !after) return;
+
+    // An order is considered placed only after stock has actually been deducted.
+    if (before.stockDeducted !== true && after.stockDeducted === true) {
+      await sendNotificationToUser(
+        after.userId,
+        "Order Placed",
+        "We've received your order and will start preparing it shortly."
+      );
+    }
 
     if (before.status === after.status) return;
 
-    let title = "";
-    let body = "";
+    const notifications: Record<string, { title: string; body: string }> = {
+      Accepted: {
+        title: "Order Accepted",
+        body: "Your order has been accepted.",
+      },
+      Packed: {
+        title: "Order Packed",
+        body: "Your order has been packed.",
+      },
+      "Out For Delivery": {
+        title: "Out for Delivery",
+        body: "Your order is on the way.",
+      },
+      Delivered: {
+        title: "Delivered",
+        body: "Your order has been delivered.",
+      },
+      Cancelled: {
+        title: "Order Cancelled",
+        body: "Your order has been cancelled.",
+      },
+      Rejected: {
+        title: "Order Rejected",
+        body: after.rejectionReason ?? "Your order could not be processed.",
+      },
+    };
 
-    switch (after.status) {
-
-      case "Accepted":
-        title = "Order Accepted";
-        body = "Your order has been accepted.";
-        break;
-
-      case "Packed":
-        title = "Order Packed";
-        body = "Your order has been packed.";
-        break;
-
-      case "Out For Delivery":
-        title = "Out for Delivery";
-        body = "Your order is on the way.";
-        break;
-
-      case "Delivered":
-        title = "Delivered";
-        body = "Your order has been delivered.";
-        break;
-
-      case "Cancelled":
-        title = "Order Cancelled";
-        body = "Your order has been cancelled.";
-        break;
-
-      case "Rejected":
-        title = "Order Rejected";
-        body = after.rejectionReason ?? "Order rejected.";
-        break;
-
-      default:
-        return;
-    }
+    const notification = notifications[after.status];
+    if (!notification) return;
 
     await sendNotificationToUser(
       after.userId,
-      title,
-      body
+      notification.title,
+      notification.body
     );
-
   }
 );
