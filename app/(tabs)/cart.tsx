@@ -112,7 +112,6 @@ export default function Cart() {
         <Text style={styles.name}>{item.name}</Text>
         <Text style={styles.unit}>{item.unit || "1 kg"}</Text>
         <View style={styles.priceContainer}>
-          <Text style={styles.price}>₹{item.price}</Text>
           <Text style={styles.totalPrice}>
             ₹{item.price * item.quantity}
           </Text>
@@ -305,11 +304,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "baseline",
     gap: 8,
-  },
-  price: {
-    fontSize: 13,
-    color: Colors.muted,
-    textDecorationLine: "line-through",
   },
   totalPrice: {
     fontSize: 15,
