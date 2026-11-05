@@ -4,7 +4,6 @@ import {
   AppState,
   Linking,
   Modal,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
