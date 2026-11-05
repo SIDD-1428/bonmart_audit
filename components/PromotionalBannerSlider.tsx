@@ -2,7 +2,6 @@ import React, { useEffect, useRef, useState } from "react";
 import { FlatList, Linking, StyleSheet, TouchableOpacity, View, useWindowDimensions } from "react-native";
 import { Image } from "expo-image";
 import { router } from "expo-router";
-import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "@/firebase/config";
 
 type Banner = { id: string; imageUrl: string; active?: boolean; position?: number; actionType?: string; actionTarget?: string };
@@ -15,7 +14,7 @@ export default function PromotionalBannerSlider() {
   const listRef = useRef<FlatList<Banner>>(null);
   const itemWidth = width - 32;
 
-  useEffect(() => onSnapshot(doc(db, "settings", "homeBanners"), (snap) => {
+  useEffect(() => db.collection("settings").doc("homeBanners").onSnapshot((snap) => {
     const data = snap.data();
     const next = (Array.isArray(data?.banners) ? data.banners : [])
       .filter((b: Banner) => b.active !== false && typeof b.imageUrl === "string" && b.imageUrl.length > 0)
